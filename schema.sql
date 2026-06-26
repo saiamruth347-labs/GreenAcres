@@ -13,6 +13,7 @@ CREATE TABLE IF NOT EXISTS users (
     bio           TEXT,
     avatar_url    VARCHAR(500) DEFAULT '',
     cover_url     VARCHAR(500) DEFAULT '',
+    clerk_id      VARCHAR(255) UNIQUE DEFAULT NULL,
     -- Social stats (denormalized for speed)
     connections   INT UNSIGNED DEFAULT 0,
     posts_count   INT UNSIGNED DEFAULT 0,

@@ -7,12 +7,13 @@
     <link href="https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700;800&display=swap" rel="stylesheet">
     <link rel="stylesheet" href="https://cdnjs.cloudflare.com/ajax/libs/font-awesome/6.4.0/css/all.min.css">
     <link rel="stylesheet" href="{{ url_for('static', filename='css/auth.css') }}">
-    {% if google_client_id %}
-    <script src="https://accounts.google.com/gsi/client" async defer></script>
-    {% endif %}
+    
+    <!-- Clerk JS SDK CDN -->
+    <script async crossorigin="anonymous" data-clerk-publishable-key="{{ clerk_publishable_key }}" src="https://{{ clerk_frontend_api }}/npm/@clerk/clerk-js@latest/dist/clerk.browser.js" type="text/javascript"></script>
 </head>
 <body class="auth-body">
     <div class="auth-split">
+        <!-- Left Side: Branding -->
         <div class="auth-brand">
             <div class="brand-inner">
                 <div class="brand-logo">
@@ -21,7 +22,6 @@
                         <img src="/static/images/logo.png" alt="GreenAcres" style="height:36px; width:36px; border-radius:50%; object-fit:cover;">
                         <span style="font-size:24px; font-weight:800; color:white;">GreenAcres</span>
                     </div>
-
                 </div>
                 <h1 class="brand-headline">Grow Together.<br>Farm Smarter.</h1>
                 <p class="brand-sub">The social network built for farmers. Connect with thousands of farming communities, share knowledge, buy & sell in the market.</p>
@@ -33,183 +33,46 @@
             </div>
         </div>
 
-        <div class="auth-form-panel">
-            <div class="auth-card">
-                <h2 class="auth-title">Welcome Back 👋</h2>
-                <p class="auth-subtitle">Log in to your GreenAcres account</p>
-
-                <div class="auth-alert error" id="login-error" style="display: none;">
-                    <i class="fa-solid fa-circle-exclamation"></i> <span id="error-message"></span>
-                </div>
-                <div class="auth-alert success" id="login-success" style="display: none;">
-                    <i class="fa-solid fa-check-circle"></i> <span id="success-message"></span>
-                </div>
-
-                <form id="login-form">
-                    <div class="input-group">
-                        <label for="email">Email or Username</label>
-                        <div class="input-wrap">
-                            <i class="fa-regular fa-envelope input-icon"></i>
-                            <input type="text" id="email" name="email" placeholder="you@example.com" required autocomplete="email">
-                        </div>
-                    </div>
-                    <div class="input-group">
-                        <label for="password">Password</label>
-                        <div class="input-wrap">
-                            <i class="fa-solid fa-lock input-icon"></i>
-                            <input type="password" id="password" name="password" placeholder="••••••••" required autocomplete="current-password">
-                            <button type="button" class="toggle-pw" onclick="togglePw('password', this)">
-                                <i class="fa-regular fa-eye"></i>
-                            </button>
-                        </div>
-                    </div>
-                    <div class="input-group">
-                        <label style="display: flex; align-items: center; gap: 8px; cursor: pointer;">
-                            <input type="checkbox" id="remember" style="width: 16px; height: 16px;">
-                            <span style="font-weight: 400; font-size: 14px;">Remember me</span>
-                        </label>
-                    </div>
-                    <button type="submit" class="auth-btn" id="login-btn">
-                        <i class="fa-solid fa-right-to-bracket"></i> Login
-                    </button>
-                    <div class="auth-loading" id="login-loading" style="display: none;">
-                        <i class="fa-solid fa-spinner fa-spin"></i> Signing in...
-                    </div>
-                </form>
-
-                <div style="display:flex; align-items:center; margin:25px 0;">
-                    <hr style="flex:1; border:none; border-top:1px solid #e2e8f0;">
-                    <span style="padding:0 15px; color:#94a3b8; font-size:14px;">OR</span>
-                    <hr style="flex:1; border:none; border-top:1px solid #e2e8f0;">
-                </div>
-
-                <!-- Google Sign In Button -->
-                {% if google_client_id %}
-                <div id="g_id_onload"
-                     data-client_id="{{ google_client_id }}"
-                     data-context="signin"
-                     data-ux_mode="popup"
-                     data-callback="handleGoogleLogin"
-                     data-auto_prompt="false">
-                </div>
-                <div class="g_id_signin"
-                     data-type="standard"
-                     data-shape="rectangular"
-                     data-theme="outline"
-                     data-text="signin_with"
-                     data-size="large"
-                     data-logo_alignment="left"
-                     style="margin-bottom:15px; display: flex; justify-content: center;">
-                </div>
-                {% else %}
-                <button type="button" class="auth-btn" style="background:#fff; color:#475569; border:1px solid #e2e8f0; margin-bottom:15px; font-weight:600;" onclick="alert('Google Auth is disabled. Set GOOGLE_CLIENT_ID in .env')">
-                    <img src="https://upload.wikimedia.org/wikipedia/commons/c/c1/Google_%22G%22_logo.svg" alt="G" style="width:18px; height:18px; margin-right:8px; vertical-align:middle;">
-                    Sign in with Google (Offline)
-                </button>
-                {% endif %}
-
-                <p class="auth-switch">New to GreenAcres? <a href="/register">Create an account</a></p>
-            </div>
+        <!-- Right Side: Clerk Authentication -->
+        <div class="auth-form-panel" style="display:flex; justify-content:center; align-items:center; background:#f8fafc;">
+            <div id="clerk-sign-in"></div>
         </div>
     </div>
 
     <script>
-        function togglePw(id, btn) {
-            const input = document.getElementById(id);
-            const icon = btn.querySelector('i');
-            if (input.type === 'password') {
-                input.type = 'text';
-                icon.className = 'fa-regular fa-eye-slash';
-            } else {
-                input.type = 'password';
-                icon.className = 'fa-regular fa-eye';
+        window.addEventListener('load', async () => {
+            if (typeof Clerk === 'undefined') {
+                console.error("Clerk SDK failed to load.");
+                return;
             }
-        }
+            await Clerk.load();
 
-        async function handleGoogleLogin(response) {
-            const errorDiv = document.getElementById('login-error');
-            const successDiv = document.getElementById('login-success');
-            
-            errorDiv.style.display = 'none';
-            successDiv.style.display = 'none';
-            
-            try {
-                const res = await fetch('/api/google-login', {
-                    method: 'POST',
-                    headers: { 'Content-Type': 'application/json' },
-                    body: JSON.stringify({ credential: response.credential })
-                });
-                
-                const data = await res.json();
-                
-                if (data.success) {
-                    successDiv.querySelector('#success-message').textContent = data.message;
-                    successDiv.style.display = 'flex';
-                    setTimeout(() => { window.location.href = '/'; }, 500);
+            // Setup listeners to write clerk_token cookie when authenticated
+            Clerk.addListener(({ session }) => {
+                if (session) {
+                    Clerk.session.getToken().then(token => {
+                        if (token) {
+                            document.cookie = `clerk_token=${token}; path=/; max-age=86400; SameSite=Lax`;
+                        }
+                    });
                 } else {
-                    document.getElementById('error-message').textContent = data.message;
-                    errorDiv.style.display = 'flex';
+                    document.cookie = "clerk_token=; path=/; max-age=0; SameSite=Lax";
                 }
-            } catch (err) {
-                document.getElementById('error-message').textContent = 'Connection error during Google login.';
-                errorDiv.style.display = 'flex';
-            }
-        }
+            });
 
-        document.getElementById('login-form').addEventListener('submit', async function(e) {
-            e.preventDefault();
-            
-            const errorDiv = document.getElementById('login-error');
-            const successDiv = document.getElementById('login-success');
-            const btn = document.getElementById('login-btn');
-            const loading = document.getElementById('login-loading');
-            
-            errorDiv.style.display = 'none';
-            successDiv.style.display = 'none';
-            btn.disabled = true;
-            btn.style.display = 'none';
-            loading.style.display = 'block';
-            
-            const email = document.getElementById('email').value.trim();
-            const password = document.getElementById('password').value;
-            const remember = document.getElementById('remember').checked;
-            
-            try {
-                const response = await fetch('/api/login', {
-                    method: 'POST',
-                    headers: { 'Content-Type': 'application/json' },
-                    body: JSON.stringify({ email, password, remember })
-                });
-                
-                const data = await response.json();
-                
-                if (data.success) {
-                    successDiv.querySelector('#success-message').textContent = data.message;
-                    successDiv.style.display = 'flex';
-                    setTimeout(() => { window.location.href = '/'; }, 500);
-                } else {
-                    document.getElementById('error-message').textContent = data.message;
-                    errorDiv.style.display = 'flex';
-                    btn.disabled = false;
-                    btn.style.display = 'flex';
-                    loading.style.display = 'none';
-                }
-            } catch (err) {
-                document.getElementById('error-message').textContent = 'Connection error. Please try again.';
-                errorDiv.style.display = 'flex';
-                btn.disabled = false;
-                btn.style.display = 'flex';
-                loading.style.display = 'none';
+            // Redirect to home if already authenticated
+            if (Clerk.user) {
+                window.location.href = '/';
+                return;
             }
+
+            // Mount Clerk's pre-built SignIn UI component
+            const signInDiv = document.getElementById('clerk-sign-in');
+            Clerk.mountSignIn(signInDiv, {
+                signUpUrl: '/register',
+                afterSignInUrl: '/',
+            });
         });
-
-        // Check if already logged in
-        (async function checkAuth() {
-            try {
-                const res = await fetch('/api/me');
-                if (res.ok) window.location.href = '/';
-            } catch {}
-        })();
     </script>
 </body>
 </html>

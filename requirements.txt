@@ -5,3 +5,4 @@ python-dotenv==1.0.1
 google-auth==2.28.1
 google-api-python-client==2.119.0
 requests==2.31.0
+cryptography==49.0.0

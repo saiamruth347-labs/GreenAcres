@@ -6,6 +6,9 @@ from datetime import datetime, timezone, timedelta
 from functools import wraps
 
 import jwt
+from jwt.algorithms import RSAAlgorithm
+import requests
+import json
 from flask import (
     Flask,
     render_template,
@@ -33,7 +36,13 @@ GOOGLE_CLIENT_ID = os.environ.get("GOOGLE_CLIENT_ID", "").strip().strip('"')
 GOOGLE_CLIENT_SECRET = os.environ.get("GOOGLE_CLIENT_SECRET", "").strip().strip('"')
 JWT_ALGORITHM = "HS256"
 JWT_EXP_HOURS = 24  # token lives for 24 hours
-COOKIE_NAME = "ac_token"  # HTTP-only cookie name
+COOKIE_NAME = "clerk_token"  # Use Clerk token cookie
+
+# Clerk Integration Config
+CLERK_PUBLISHABLE_KEY = os.environ.get("CLERK_PUBLISHABLE_KEY", "").strip().strip('"')
+CLERK_SECRET_KEY = os.environ.get("CLERK_SECRET_KEY", "").strip().strip('"')
+CLERK_FRONTEND_API = os.environ.get("CLERK_FRONTEND_API", "lucky-lark-96.clerk.accounts.dev").strip().strip('"')
+CLERK_JWKS_URL = f"https://{CLERK_FRONTEND_API}/.well-known/jwks.json"
 
 UPLOAD_FOLDER = os.path.join(os.getcwd(), 'static', 'uploads', 'posts')
 MARKET_UPLOAD_FOLDER = os.path.join(os.getcwd(), 'static', 'uploads', 'market')
@@ -123,6 +132,14 @@ def internal_error(e):
     return "Oops! AgriConnect encountered a glitch. Check your database connection settings in the Vercel dashboard.", 500
 
 
+@app.context_processor
+def inject_clerk_config():
+    return {
+        "clerk_publishable_key": CLERK_PUBLISHABLE_KEY,
+        "clerk_frontend_api": CLERK_FRONTEND_API,
+    }
+
+
 # ──────────────────────────────────────────────
 #  Password helpers (SHA-256)
 # ──────────────────────────────────────────────
@@ -150,44 +167,176 @@ def create_token(user_id: int, username: str) -> str:
     return encoded
 
 
-def decode_token(token: str):
-    """Return decoded payload or None."""
-    try:
-        return jwt.decode(token, SECRET_KEY, algorithms=[JWT_ALGORITHM])
-    except jwt.ExpiredSignatureError:
+_jwks_cache = None
+
+def get_jwks():
+    global _jwks_cache
+    if _jwks_cache is None:
+        try:
+            print(f"[CLERK] Fetching JWKS from {CLERK_JWKS_URL}...")
+            resp = requests.get(CLERK_JWKS_URL, timeout=5)
+            if resp.status_code == 200:
+                _jwks_cache = resp.json()
+                print("[CLERK] JWKS successfully cached.")
+            else:
+                print(f"[CLERK] Failed to fetch JWKS: HTTP {resp.status_code}")
+        except Exception as e:
+            print(f"[CLERK] JWKS Fetch exception: {e}")
+    return _jwks_cache
+
+
+def verify_clerk_token(token: str):
+    """Verify the Clerk JWT session token and return its payload, or None."""
+    if not token:
         return None
-    except jwt.InvalidTokenError:
+    try:
+        # 1. Unverified decode to find key ID (kid)
+        header = jwt.get_unverified_header(token)
+        kid = header.get("kid")
+        if not kid:
+            print("[CLERK] Token header missing 'kid'.")
+            return None
+            
+        # 2. Get public key from JWKS
+        jwks = get_jwks()
+        if not jwks or "keys" not in jwks:
+            print("[CLERK] No valid JWKS cached.")
+            return None
+            
+        jwk = None
+        for key in jwks["keys"]:
+            if key.get("kid") == kid:
+                jwk = key
+                break
+        if not jwk:
+            print(f"[CLERK] Key {kid} not found in JWKS.")
+            return None
+            
+        # 3. Load public key
+        public_key = RSAAlgorithm.from_jwk(jwk)
+        
+        # 4. Decode and verify token
+        payload = jwt.decode(
+            token,
+            public_key,
+            algorithms=["RS256"],
+            options={"verify_aud": False}
+        )
+        return payload
+    except Exception as e:
+        print(f"[CLERK] Token verification error: {e}")
         return None
 
 
 def get_current_user():
-    """Read JWT from cookie and return user dict, or None."""
+    """Verify Clerk session cookie, load or create the user in local MySQL DB, or fallback to mock user."""
     token = request.cookies.get(COOKIE_NAME)
     if not token:
         return None
-    payload = decode_token(token)
+        
+    payload = verify_clerk_token(token)
     if not payload:
         return None
         
-    # If using the demo farmer login fallback (id=0), return the fallback user directly
-    # so authentication works even if the DB is uninitialized.
-    if payload.get("sub") == 0:
-        return DEMO_USER.copy()
-        
-    # Check if token has been revoked (logout)
-    try:
-        is_revoked = query(
-            "SELECT 1 FROM revoked_tokens WHERE jti=%s", (payload["jti"],), one=True
-        )
-        if is_revoked:
-            return None
-        user = query(
-            "SELECT * FROM users WHERE id=%s AND is_active=1", (payload["sub"],), one=True
-        )
-        return user
-    except Exception:
-        # Fallback to demo user if DB queries fail completely
+    clerk_id = payload.get("sub")
+    if not clerk_id:
         return None
+        
+    # Helper to construct a mock/fallback user if database is disconnected
+    def get_fallback_user():
+        email = payload.get("email") or ""
+        if not email:
+            email = f"{clerk_id}@clerk.agriconnect.in"
+            
+        full_name = payload.get("name")
+        if not full_name:
+            first_name = payload.get("first_name") or ""
+            last_name = payload.get("last_name") or ""
+            full_name = f"{first_name} {last_name}".strip() or email.split("@")[0].capitalize() or "Clerk User"
+            
+        avatar_url = payload.get("picture") or payload.get("image_url") or f"https://ui-avatars.com/api/?name={full_name[0]}&background=1b873f&color=fff&rounded=true"
+        username = email.split("@")[0].lower() or clerk_id.lower()
+        
+        return {
+            "id": 0,
+            "full_name": full_name,
+            "username": username,
+            "email": email,
+            "title": "AgriConnect Member (Offline Mode)",
+            "location": "India",
+            "connections": 342,
+            "avatar_url": avatar_url,
+            "clerk_id": clerk_id
+        }
+
+    # 1. Try to load user from local database by clerk_id
+    try:
+        user = query("SELECT * FROM users WHERE clerk_id=%s AND is_active=1", (clerk_id,), one=True)
+        if user:
+            return user
+    except Exception as e:
+        print(f"[CLERK] Local DB query failed: {e}. Falling back to mock session.")
+        return get_fallback_user()
+
+    # 2. Sync / create user from Clerk API using CLERK_SECRET_KEY
+    if not CLERK_SECRET_KEY:
+        print("[CLERK] CLERK_SECRET_KEY not set. Falling back to local offline user.")
+        return get_fallback_user()
+
+    try:
+        headers = {"Authorization": f"Bearer {CLERK_SECRET_KEY}"}
+        resp = requests.get(f"https://api.clerk.com/v1/users/{clerk_id}", headers=headers, timeout=5)
+        if resp.status_code != 200:
+            print(f"[CLERK] API call failed: HTTP {resp.status_code}. Using fallback user.")
+            return get_fallback_user()
+            
+        clerk_user = resp.json()
+        
+        email = ""
+        if clerk_user.get("email_addresses"):
+            email = clerk_user["email_addresses"][0].get("email_address", "")
+        if not email:
+            email = f"{clerk_id}@clerk.agriconnect.in"
+
+        first_name = clerk_user.get("first_name") or ""
+        last_name = clerk_user.get("last_name") or ""
+        full_name = f"{first_name} {last_name}".strip() or "Clerk User"
+        avatar_url = clerk_user.get("image_url") or clerk_user.get("profile_image_url") or ""
+        
+        username = clerk_user.get("username")
+        if not username:
+            username = email.split("@")[0].lower()
+
+        # Ensure username uniqueness
+        try:
+            base_username = username
+            counter = 1
+            while query("SELECT id FROM users WHERE username=%s", (username,), one=True):
+                username = f"{base_username}{counter}"
+                counter += 1
+        except:
+            pass
+
+        # Check if user already exists by email
+        existing_user = query("SELECT * FROM users WHERE email=%s AND is_active=1", (email,), one=True)
+        if existing_user:
+            execute("UPDATE users SET clerk_id=%s, avatar_url=%s WHERE id=%s", (clerk_id, avatar_url or existing_user["avatar_url"], existing_user["id"]))
+            return query("SELECT * FROM users WHERE id=%s", (existing_user["id"],), one=True)
+
+        # Create new local user
+        res = execute(
+            """INSERT INTO users
+               (full_name, username, email, password_hash, title, location, avatar_url, clerk_id)
+               VALUES (%s, %s, %s, %s, %s, %s, %s, %s)""",
+            (full_name, username, email, "clerk-auth", "AgriConnect Member", "India", avatar_url, clerk_id)
+        )
+        if res > 0:
+            return query("SELECT * FROM users WHERE id=%s", (res,), one=True)
+            
+    except Exception as e:
+        print(f"[CLERK] Exception in syncing user profile: {e}")
+        
+    return get_fallback_user()
 
 
 # ──────────────────────────────────────────────
@@ -376,6 +525,7 @@ def load_posts_db():
 
 
 # ══════════════════════════════════════════════
+# ══════════════════════════════════════════════
 #  AUTH ROUTES
 # ══════════════════════════════════════════════
 
@@ -384,126 +534,27 @@ def load_posts_db():
 def login_page():
     if get_current_user():
         return redirect("/")
-    return render_template("login.html", error=None, google_client_id=GOOGLE_CLIENT_ID)
-
-
-@app.route("/login", methods=["POST"])
-def login_post():
-    email_or_user = request.form.get("email", "").strip()
-    password = request.form.get("password", "")
-
-    if not email_or_user or not password:
-        return render_template("login.html", error="Please fill in all fields.")
-
-    # Try finding user by email or username
-    user = query(
-        "SELECT * FROM users WHERE (email=%s OR username=%s) AND is_active=1",
-        (email_or_user, email_or_user),
-        one=True,
+    return render_template(
+        "login.html",
+        clerk_publishable_key=CLERK_PUBLISHABLE_KEY,
+        clerk_frontend_api=CLERK_FRONTEND_API
     )
-
-    if user is None:
-        if (
-            email_or_user in ("demo@agriconnect.in", "demo_farmer")
-            and password == "farmer123"
-        ):
-
-            user = DEMO_USER.copy()
-            token = create_token(0, "demo_farmer")
-            resp = make_response(redirect("/"))
-            resp.set_cookie(
-                COOKIE_NAME, token, httponly=True, secure=False, samesite="Lax", max_age=JWT_EXP_HOURS * 3600
-            )
-            return resp
-        return render_template("login.html", error="Invalid credentials.")
-
-    if not check_password(password, user["password_hash"]):
-        return render_template("login.html", error="Invalid email or password.")
-
-    # Update last_login
-    execute("UPDATE users SET last_login=%s WHERE id=%s", (datetime.now(), user["id"]))
-
-    token = create_token(user["id"], user["username"])
-    resp = make_response(redirect("/"))
-    resp.set_cookie(
-        COOKIE_NAME, token, httponly=True, secure=False, samesite="Lax", max_age=JWT_EXP_HOURS * 3600
-    )
-    return resp
 
 
 @app.route("/register", methods=["GET"])
 def register_page():
     if get_current_user():
         return redirect("/")
-    return render_template("register.html", error=None, google_client_id=GOOGLE_CLIENT_ID)
-
-
-@app.route("/register", methods=["POST"])
-def register_post():
-    full_name = request.form.get("full_name", "").strip()
-    username = request.form.get("username", "").strip().lower()
-    email = request.form.get("email", "").strip().lower()
-    title = request.form.get("title", "").strip()
-    location = request.form.get("location", "").strip()
-    password = request.form.get("password", "")
-    confirm_pw = request.form.get("confirm_password", "")
-
-    if not all([full_name, username, email, password]):
-        return render_template(
-            "register.html", error="Please fill in all required fields."
-        )
-    if len(password) < 6:
-        return render_template(
-            "register.html", error="Password must be at least 6 characters."
-        )
-    if password != confirm_pw:
-        return render_template("register.html", error="Passwords do not match.")
-
-    avatar_url = (
-        f"https://ui-avatars.com/api/?name={full_name.replace(' ', '+')}"
-        f"&background=1b873f&color=fff&rounded=true"
+    return render_template(
+        "register.html",
+        clerk_publishable_key=CLERK_PUBLISHABLE_KEY,
+        clerk_frontend_api=CLERK_FRONTEND_API
     )
-    pw_hash = hash_password(password)
-
-    result = execute(
-        """INSERT INTO users
-           (full_name, username, email, password_hash, title, location, avatar_url)
-           VALUES (%s, %s, %s, %s, %s, %s, %s)""",
-        (full_name, username, email, pw_hash, title, location, avatar_url),
-    )
-
-    print(f"[Register] DB result: {result}") # DEBUG
-
-    if result == -2:
-        return render_template(
-            "register.html", error="Email or username already registered."
-        )
-    if result < 0:
-        # DB not ready – still issue a token for demo purposes (id=0)
-        print("[Register] DB Error detected, falling back to demo login")
-        token = create_token(0, username)
-        resp = make_response(redirect("/"))
-        resp.set_cookie(COOKIE_NAME, token, httponly=True, max_age=JWT_EXP_HOURS * 3600)
-        return resp
-
-    token = create_token(result, username)
-    resp = make_response(redirect("/"))
-    resp.set_cookie(
-        COOKIE_NAME, token, httponly=True, max_age=JWT_EXP_HOURS * 3600, samesite="Lax"
-    )
-    return resp
 
 
 @app.route("/logout")
 def logout():
-    """Revoke token and clear cookie."""
-    token = request.cookies.get(COOKIE_NAME)
-    if token:
-        payload = decode_token(token)
-        if payload:
-            execute(
-                "INSERT IGNORE INTO revoked_tokens (jti) VALUES (%s)", (payload["jti"],)
-            )
+    """Clear clerk token cookie and redirect to login."""
     resp = make_response(redirect("/login"))
     resp.delete_cookie(COOKIE_NAME)
     return resp

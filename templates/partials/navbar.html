@@ -60,7 +60,32 @@
     </div>
 </nav>
 
+<!-- Clerk JS SDK CDN -->
+<script async crossorigin="anonymous" data-clerk-publishable-key="{{ clerk_publishable_key }}" src="https://{{ clerk_frontend_api }}/npm/@clerk/clerk-js@latest/dist/clerk.browser.js" type="text/javascript"></script>
+
 <script>
+    // Initialize Clerk and setup session sync
+    window.addEventListener('load', async () => {
+        if (typeof Clerk === 'undefined') {
+            console.error("Clerk SDK failed to load.");
+            return;
+        }
+        await Clerk.load();
+        
+        // Sync Clerk token with clerk_token cookie
+        Clerk.addListener(({ session }) => {
+            if (session) {
+                Clerk.session.getToken().then(token => {
+                    if (token) {
+                        document.cookie = `clerk_token=${token}; path=/; max-age=86400; SameSite=Lax`;
+                    }
+                });
+            } else {
+                document.cookie = "clerk_token=; path=/; max-age=0; SameSite=Lax";
+            }
+        });
+    });
+
     // Highlight active nav item based on current path
     (function () {
         const path = window.location.pathname;
@@ -78,8 +103,11 @@
         document.getElementById('profile-dropdown')?.classList.remove('open');
     });
     async function logout() {
+        if (typeof Clerk !== 'undefined') {
+            await Clerk.signOut();
+        }
         try {
-            await fetch('/api/logout', { method: 'POST' });
+            await fetch('/logout');
         } catch {}
         window.location.href = '/login';
     }
