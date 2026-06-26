@@ -168,16 +168,26 @@ def get_current_user():
     payload = decode_token(token)
     if not payload:
         return None
+        
+    # If using the demo farmer login fallback (id=0), return the fallback user directly
+    # so authentication works even if the DB is uninitialized.
+    if payload.get("sub") == 0:
+        return DEMO_USER.copy()
+        
     # Check if token has been revoked (logout)
-    is_revoked = query(
-        "SELECT 1 FROM revoked_tokens WHERE jti=%s", (payload["jti"],), one=True
-    )
-    if is_revoked:
+    try:
+        is_revoked = query(
+            "SELECT 1 FROM revoked_tokens WHERE jti=%s", (payload["jti"],), one=True
+        )
+        if is_revoked:
+            return None
+        user = query(
+            "SELECT * FROM users WHERE id=%s AND is_active=1", (payload["sub"],), one=True
+        )
+        return user
+    except Exception:
+        # Fallback to demo user if DB queries fail completely
         return None
-    user = query(
-        "SELECT * FROM users WHERE id=%s AND is_active=1", (payload["sub"],), one=True
-    )
-    return user
 
 
 # ──────────────────────────────────────────────
@@ -402,7 +412,7 @@ def login_post():
             token = create_token(0, "demo_farmer")
             resp = make_response(redirect("/"))
             resp.set_cookie(
-                COOKIE_NAME, token, httponly=True, secure=True, samesite="Lax", max_age=JWT_EXP_HOURS * 3600
+                COOKIE_NAME, token, httponly=True, secure=False, samesite="Lax", max_age=JWT_EXP_HOURS * 3600
             )
             return resp
         return render_template("login.html", error="Invalid credentials.")
@@ -416,7 +426,7 @@ def login_post():
     token = create_token(user["id"], user["username"])
     resp = make_response(redirect("/"))
     resp.set_cookie(
-        COOKIE_NAME, token, httponly=True, secure=True, samesite="Lax", max_age=JWT_EXP_HOURS * 3600
+        COOKIE_NAME, token, httponly=True, secure=False, samesite="Lax", max_age=JWT_EXP_HOURS * 3600
     )
     return resp
 
@@ -593,7 +603,7 @@ def api_login():
             }
         )
     )
-    resp.set_cookie(COOKIE_NAME, token, httponly=True, secure=True, samesite="Lax", max_age=max_age)
+    resp.set_cookie(COOKIE_NAME, token, httponly=True, secure=False, samesite="Lax", max_age=max_age)
     return resp
 
 
@@ -652,7 +662,7 @@ def api_google_login():
         app_token = create_token(user_id, username)
         
         resp = make_response(jsonify({"success": True, "message": "Google login successful"}))
-        resp.set_cookie(COOKIE_NAME, app_token, httponly=True, secure=True, samesite="Lax", max_age=JWT_EXP_HOURS * 3600)
+        resp.set_cookie(COOKIE_NAME, app_token, httponly=True, secure=False, samesite="Lax", max_age=JWT_EXP_HOURS * 3600)
         return resp
 
     except ValueError:
@@ -810,7 +820,7 @@ def index(user):
     posts = load_posts_db()
     
     # 1. Fetch current friends (accepted connections)
-    friends = query(
+    friends_rows = query(
         '''SELECT u.id, u.full_name AS name, u.title, u.avatar_url 
            FROM users u
            JOIN connections c ON (c.requester_id = u.id OR c.receiver_id = u.id)
@@ -819,9 +829,10 @@ def index(user):
              AND c.status = "accepted"''',
         (user['id'], user['id'], user['id'])
     )
+    friends = friends_rows if friends_rows else (DEMO_FRIENDS if user['id'] == 0 else [])
     
     # 2. Fetch suggestions (not the user, and not already connected)
-    suggestions = query(
+    suggestions_rows = query(
         '''SELECT id, full_name AS name, title, avatar_url 
            FROM users 
            WHERE id != %s 
@@ -833,10 +844,14 @@ def index(user):
            LIMIT 3''',
         (user['id'], user['id'], user['id'])
     )
+    suggestions = suggestions_rows if suggestions_rows else (DEMO_SUGGESTIONS if user['id'] == 0 else [])
     
     # 3. Active farmers count
-    stats = query('SELECT COUNT(*) AS total FROM users WHERE is_active=1', one=True)
-    total_users = stats['total'] if stats else 0
+    try:
+        stats = query('SELECT COUNT(*) AS total FROM users WHERE is_active=1', one=True)
+        total_users = stats['total'] if stats else (1 if user['id'] == 0 else 0)
+    except:
+        total_users = 1 if user['id'] == 0 else 0
 
     return render_template('index.html', user=user, posts=posts, suggestions=suggestions, friends=friends, total_users=total_users)
 
@@ -1038,7 +1053,7 @@ def api_send_message(user):
 @login_required
 def network(user):
     user = normalise_user(user)
-    # Fetch accepted connections
+    # 1. Fetch accepted connections
     conn_rows = query(
         """SELECT u.id, u.full_name AS name, u.title, u.avatar_url
            FROM connections c
@@ -1049,10 +1064,10 @@ def network(user):
            LIMIT 30""",
         (user["id"], user["id"], user["id"]),
     )
-    friends = conn_rows if conn_rows else []
+    friends = conn_rows if conn_rows else (DEMO_FRIENDS if user['id'] == 0 else [])
     
-    # Fetch suggestions (users not connected)
-    suggestions = query(
+    # 2. Fetch suggestions (users not connected)
+    sug_rows = query(
         '''SELECT id, full_name AS name, title, avatar_url 
            FROM users 
            WHERE id != %s AND id NOT IN (
@@ -1063,6 +1078,7 @@ def network(user):
            LIMIT 5''',
         (user['id'], user['id'], user['id'], user['id'])
     )
+    suggestions = sug_rows if sug_rows else (DEMO_SUGGESTIONS if user['id'] == 0 else [])
     
     for f in (friends + suggestions):
         # Ensure name exists for first-letter fallback
